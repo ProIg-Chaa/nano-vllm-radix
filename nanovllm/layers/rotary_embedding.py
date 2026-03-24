@@ -48,7 +48,27 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 
+def _normalize_rope_scaling(rope_scaling: dict | None) -> tuple | None:
+    if rope_scaling is None:
+        return None
+    if rope_scaling.get("rope_type", "default") == "default":
+        return None
+    return tuple(sorted(rope_scaling.items()))
+
+
 @lru_cache(1)
+def _get_rope(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    rope_scaling: tuple | None = None,
+):
+    assert rope_scaling is None
+    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
+    return rotary_emb
+
+
 def get_rope(
     head_size: int,
     rotary_dim: int,
@@ -56,6 +76,5 @@ def get_rope(
     base: float,
     rope_scaling: dict | None = None,
 ):
-    assert rope_scaling is None
-    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
-    return rotary_emb
+    rope_scaling = _normalize_rope_scaling(rope_scaling)
+    return _get_rope(head_size, rotary_dim, max_position, base, rope_scaling)
