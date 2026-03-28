@@ -502,3 +502,97 @@ This matched the expected block-level behavior exactly, confirming that ownershi
 Phase 6 should choose between two directions:
 - add an actual node-level retention / eviction policy using the metadata added in Phase 5
 - start attacking the bigger architectural gap: reuse granularity finer than full blocks
+
+## Phase 6 - Return To Stage A And Add Minimal Retention / Eviction
+
+### Route Choice
+At this point the project deliberately returned to **Stage A** as the mainline.
+The rationale was:
+- the long-term target is still SGLang-style radix integration
+- but the current system still needs a more operational block-level cache manager before finer-grained reuse is introduced
+- therefore the next step should not yet attack partial-block reuse
+- instead it should give the existing prefix tree a minimal, explicit retention / eviction policy
+
+This keeps the cache manager evolution incremental:
+1. stabilize the block-level tree as a managed cache
+2. then move toward finer logical reuse granularity and more SGLang-like addressing
+
+### Objective
+Add a low-risk node-level retention framework so the prefix tree can explicitly drop cold cached leaves under allocation pressure, rather than keeping every free cached path indefinitely.
+
+### Files Changed
+- `nanovllm/engine/block_manager.py`
+- `nanovllm/engine/llm_engine.py`
+
+### Main Design Change
+Introduced the first minimal eviction behavior for the tree.
+The tree now distinguishes between:
+- active blocks that are still in use by requests
+- free cached leaves that may be retained
+- free cached leaves that may be evicted when free-block pressure becomes high
+
+This is still block-granular and intentionally conservative.
+It does not change prefix hit semantics.
+
+### New Prefix Cache Capabilities
+`PrefixTreeNode` now exposes `is_leaf`, and `PrefixCache` now supports:
+- iterating leaves
+- collecting evictable leaves
+- selecting a cold eviction candidate
+- evicting a single retained leaf
+
+A leaf is considered evictable only if:
+- it corresponds to a real cached block id
+- it has no children
+- its physical block is not currently in active use
+- it is not protected by the current allocation plan
+
+### Eviction Policy
+Added a minimal low-watermark retention rule in `BlockManager`.
+
+`BlockManager` now has:
+- `retention_low_watermark`
+- `apply_retention_policy(required_free_blocks, protected_block_ids)`
+
+Behavior:
+- before prefill allocation, protect the blocks referenced by the current plan
+- if projected free blocks would fall below the watermark, prune a small number of cold retained leaves
+- when decode needs a new physical block, apply the same policy before allocating the next free block
+
+Candidate selection is recency-biased:
+- older `last_access_tick` is evicted first
+- lower `touch_count` is evicted first on ties
+- deeper leaves are preferred on ties to avoid prematurely dropping shallower shared structure
+
+### Why This Matters
+This phase does not increase reuse granularity.
+Partial blocks are still not reusable.
+However, it gives the tree a real cache-management behavior instead of treating every freed full block as retained forever.
+
+That matters for the next stages because:
+- the tree now has an explicit retained-vs-evicted lifecycle
+- later policies can extend this instead of inventing eviction from scratch
+- the project has a clearer separation between active use, retention, and discard
+
+### New Observability
+Added two stats to the prefix-cache printout:
+- `eviction_passes`
+- `evicted_leaves`
+
+This makes retention behavior visible in experiments.
+
+### Expected Validation
+The shared-prefix regression should still preserve the old hit behavior in the common case.
+For the small synthetic regression, eviction counters are expected to stay at or near zero because the test is not pressure-heavy.
+
+### What Was Learned From Phase 6
+1. Returning to Stage A was a deliberate engineering choice, not a retreat from the SGLang goal.
+2. Before attacking finer-grained reuse, the block-level tree needs explicit cache-lifecycle semantics.
+3. A minimal leaf-eviction policy can be added without disturbing the existing scheduler or block-level reuse behavior.
+
+### Recommended Next Step
+Continue Stage A only far enough to make the cache manager trustworthy:
+- verify retention / eviction behavior under stronger pressure workloads
+- decide whether node pin metadata is needed explicitly
+- then move to the larger Stage B/C work: decoupling logical reuse granularity from physical block storage
+

@@ -79,6 +79,10 @@ class PrefixTreeNode:
     last_access_tick: int = 0
     children: dict[tuple[int, ...], "PrefixTreeNode"] = field(default_factory=dict)
 
+    @property
+    def is_leaf(self) -> bool:
+        return not self.children
+
 
 class PrefixCache:
 
@@ -137,6 +141,54 @@ class PrefixCache:
             parent.children[key] = node
         return node
 
+    def _iter_leaves(self, node: PrefixTreeNode | None = None):
+        node = self.root if node is None else node
+        if node.is_leaf:
+            if node is not self.root:
+                yield node
+            return
+        for child in node.children.values():
+            yield from self._iter_leaves(child)
+
+    def collect_evictable_leaves(
+        self,
+        allocator: KVBlockAllocator,
+        protected_block_ids: set[int] | None = None,
+    ) -> list[PrefixTreeNode]:
+        protected_block_ids = set() if protected_block_ids is None else protected_block_ids
+        leaves = []
+        for leaf in self._iter_leaves():
+            if leaf.block_id == -1:
+                continue
+            if leaf.block_id in protected_block_ids:
+                continue
+            if allocator.is_used(leaf.block_id):
+                continue
+            leaves.append(leaf)
+        return leaves
+
+    def select_eviction_candidate(
+        self,
+        allocator: KVBlockAllocator,
+        protected_block_ids: set[int] | None = None,
+    ) -> PrefixTreeNode | None:
+        candidates = self.collect_evictable_leaves(allocator, protected_block_ids)
+        if not candidates:
+            return None
+        return min(candidates, key=lambda node: (node.last_access_tick, node.touch_count, -node.depth, node.block_id))
+
+    def evict_one_leaf(
+        self,
+        allocator: KVBlockAllocator,
+        protected_block_ids: set[int] | None = None,
+    ) -> int | None:
+        candidate = self.select_eviction_candidate(allocator, protected_block_ids)
+        if candidate is None:
+            return None
+        block_id = candidate.block_id
+        self._prune_subtree(candidate)
+        return block_id
+
     def commit(self, parent: PrefixTreeNode, block: Block, block_hash: int, token_ids: list[int]) -> PrefixTreeNode:
         if block_hash == -1:
             return self.root
@@ -186,6 +238,7 @@ class BlockManager:
         self.free_block_ids = self.allocator.free_block_ids
         self.used_block_ids = self.allocator.used_block_ids
         self.hash_to_block_id = self.prefix_cache.hash_to_block_id
+        self.retention_low_watermark = max(1, num_blocks // 8)
         self.stats = {
             "alloc_requests": 0,
             "dealloc_requests": 0,
@@ -194,6 +247,8 @@ class BlockManager:
             "miss_blocks": 0,
             "reused_tokens": 0,
             "new_blocks": 0,
+            "eviction_passes": 0,
+            "evicted_leaves": 0,
         }
 
     def reset_stats(self):
@@ -245,12 +300,34 @@ class BlockManager:
             plan = self.make_prefill_plan(seq)
         return self.allocator.has_free_blocks(plan.required_free_blocks)
 
+    def apply_retention_policy(
+        self,
+        required_free_blocks: int,
+        protected_block_ids: set[int] | None = None,
+    ) -> int:
+        projected_free_blocks = self.allocator.num_free_blocks() - required_free_blocks
+        if projected_free_blocks > self.retention_low_watermark:
+            return 0
+        budget = max(1, min(required_free_blocks or 1, self.retention_low_watermark - projected_free_blocks + 1))
+        protected_block_ids = set() if protected_block_ids is None else protected_block_ids
+        self.stats["eviction_passes"] += 1
+        evicted = 0
+        for _ in range(budget):
+            block_id = self.prefix_cache.evict_one_leaf(self.allocator, protected_block_ids)
+            if block_id is None:
+                break
+            evicted += 1
+        self.stats["evicted_leaves"] += evicted
+        return evicted
+
     def allocate(self, seq: Sequence, plan: PrefillPlan | None = None):
         assert not seq.block_table
         if plan is None:
             plan = self.make_prefill_plan(seq)
 
         self.stats["alloc_requests"] += 1
+        protected_block_ids = {step.block_id for step in plan.steps if step.block_id != -1}
+        self.apply_retention_policy(plan.required_free_blocks, protected_block_ids)
         seq.num_cached_tokens = plan.cached_tokens
         prefix_node = self.prefix_cache.root
 
@@ -291,6 +368,7 @@ class BlockManager:
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:
             assert last_block.hash != -1
+            self.apply_retention_policy(1, set(block_table))
             block_id, _ = self.allocator.allocate_next_free_block()
             block_table.append(block_id)
         elif len(seq) % self.block_size == 0:
