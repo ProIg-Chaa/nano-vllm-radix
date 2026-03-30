@@ -5,11 +5,75 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import LogicalPageSpan, RequestPrefillLayout, Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
+
+def synthesize_uncached_prefill_layout(seq: Sequence) -> RequestPrefillLayout:
+    uncached_page_spans = []
+    if seq.num_logical_pages:
+        uncached_page_spans = [LogicalPageSpan(0, seq.num_logical_pages, 0, len(seq), False)]
+    return RequestPrefillLayout(
+        page_block_ids=[-1] * seq.num_logical_pages,
+        cached_page_mask=[False] * seq.num_logical_pages,
+        cached_page_spans=[],
+        uncached_page_spans=uncached_page_spans,
+        uncached_start_token=0,
+        uncached_end_token=len(seq),
+        uncached_start_page=0,
+        uncached_num_pages=seq.num_logical_pages,
+        uncached_num_tokens=len(seq),
+    )
+
+
+def get_effective_prefill_layout(seq: Sequence) -> RequestPrefillLayout:
+    if seq.prefill_layout is not None:
+        return seq.prefill_layout
+    assert not seq.block_table
+    assert seq.num_cached_tokens == 0
+    return synthesize_uncached_prefill_layout(seq)
+
+
+def build_legacy_prefill_slot_mapping(seq: Sequence, block_size: int) -> list[int]:
+    slot_mapping = []
+    if not seq.block_table:
+        return slot_mapping
+    for i in range(seq.num_cached_blocks, seq.num_blocks):
+        start = seq.block_table[i] * block_size
+        if i != seq.num_blocks - 1:
+            end = start + block_size
+        else:
+            end = start + seq.last_block_num_tokens
+        slot_mapping.extend(range(start, end))
+    return slot_mapping
+
+
+def build_page_aware_prefill_slot_mapping(
+    seq: Sequence,
+    block_size: int,
+    layout: RequestPrefillLayout | None = None,
+) -> list[int]:
+    layout = get_effective_prefill_layout(seq) if layout is None else layout
+    if not seq.block_table:
+        return []
+    if not seq.logical_page_table:
+        seq.sync_logical_page_table()
+    uncached_page_refs = seq.logical_page_table[
+        layout.uncached_start_page: layout.uncached_start_page + layout.uncached_num_pages
+    ]
+    assert len(uncached_page_refs) == layout.uncached_num_pages
+    slot_mapping = []
+    for page_idx, page_ref in enumerate(uncached_page_refs, start=layout.uncached_start_page):
+        assert not layout.cached_page_mask[page_idx]
+        assert page_ref.cached is False
+        assert layout.page_block_ids[page_idx] == page_ref.block_id
+        start = page_ref.block_id * block_size + page_ref.block_offset
+        end = start + page_ref.page_tokens
+        slot_mapping.extend(range(start, end))
+    assert len(slot_mapping) == layout.uncached_num_tokens
+    return slot_mapping
 
 
 class ModelRunner:
@@ -125,7 +189,33 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
+    def prepare_logical_page_metadata(self, seqs: list[Sequence]):
+        metadata = []
+        for seq in seqs:
+            layout = get_effective_prefill_layout(seq)
+            if seq.block_table:
+                if not seq.logical_page_table:
+                    seq.sync_logical_page_table()
+                total_span_pages = sum(
+                    span.end_page - span.start_page
+                    for span in layout.cached_page_spans + layout.uncached_page_spans
+                )
+                assert total_span_pages == seq.num_logical_pages
+                assert layout.uncached_start_token == seq.num_cached_tokens
+                assert layout.uncached_end_token == len(seq)
+                assert layout.uncached_num_tokens == len(seq) - seq.num_cached_tokens
+                assert layout.uncached_start_page == seq.num_cached_logical_pages
+                assert layout.uncached_num_pages == seq.num_logical_pages - seq.num_cached_logical_pages
+                if layout.cached_page_spans:
+                    assert len(layout.cached_page_spans) == 1
+                    assert layout.cached_page_spans[0].start_page == 0
+                if layout.cached_page_spans and layout.uncached_page_spans:
+                    assert layout.cached_page_spans[-1].end_page == layout.uncached_page_spans[0].start_page
+            metadata.append(layout)
+        return metadata
+
     def prepare_prefill(self, seqs: list[Sequence]):
+        logical_page_metadata = self.prepare_logical_page_metadata(seqs)
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -136,9 +226,13 @@ class ModelRunner:
         block_tables = None
         for seq in seqs:
             seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
-            seqlen_q = seqlen - seq.num_cached_tokens
+            layout = logical_page_metadata.pop(0)
+            uncached_start = layout.uncached_start_token
+            uncached_end = layout.uncached_end_token
+            assert uncached_start == seq.num_cached_tokens
+            input_ids.extend(seq[uncached_start:uncached_end])
+            positions.extend(list(range(uncached_start, uncached_end)))
+            seqlen_q = layout.uncached_num_tokens
             seqlen_k = seqlen
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
@@ -146,13 +240,10 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
-                else:
-                    end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
+            page_aware_slot_mapping = build_page_aware_prefill_slot_mapping(seq, self.block_size, layout)
+            legacy_slot_mapping = build_legacy_prefill_slot_mapping(seq, self.block_size)
+            assert page_aware_slot_mapping == legacy_slot_mapping
+            slot_mapping.extend(page_aware_slot_mapping)
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)

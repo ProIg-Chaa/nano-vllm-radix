@@ -765,3 +765,153 @@ The next Stage B step should connect this request-side mapping to a more explici
 - reason about contiguous cached page spans instead of only block hits
 - then start threading page-layout metadata into `ModelRunner.prepare_prefill()` as read-only structure before changing the actual KV storage layout
 
+## Phase 9 - Add Page Span Planning And Read-Only Runner Consumption
+
+### Objective
+Continue Stage B by promoting page metadata from flat per-page tables to a span-oriented planning abstraction, then let `ModelRunner.prepare_prefill()` consume that metadata in a read-only way before any actual KV-addressing refactor.
+
+### Files Changed
+- `nanovllm/engine/sequence.py`
+- `nanovllm/engine/block_manager.py`
+- `nanovllm/engine/model_runner.py`
+
+### Main Design Change
+Introduced explicit logical-page spans.
+The system can now describe contiguous cached and uncached page regions instead of only storing a per-page mask.
+
+This is important because later KV-addressing work will almost certainly reason about reused prefix **ranges**, not isolated page entries.
+
+### Sequence-Level Additions
+Added `LogicalPageSpan` plus `Sequence.logical_page_spans()`.
+This groups `logical_page_table` into contiguous spans, each carrying:
+- `start_page`
+- `end_page`
+- `start_token`
+- `end_token`
+- `cached`
+
+So the request-side page layout now has both:
+- a fine-grained table view
+- a higher-level span view
+
+### Prefill Plan Extension
+`PrefillPlan` now carries:
+- `cached_page_spans`
+- `uncached_page_spans`
+
+These are built directly from `cached_page_mask` during planning.
+That means the planning path can now explicitly describe:
+- the reused page prefix region
+- the uncached page tail region
+
+without changing the underlying block-level allocation path.
+
+### ModelRunner Integration
+`ModelRunner.prepare_prefill()` now reads the request-side page metadata through `prepare_logical_page_metadata()`.
+This step is intentionally read-only.
+It currently uses spans to:
+- validate that cached/uncached page spans agree with `num_cached_tokens`
+- derive the uncached start token from the uncached span boundary
+- keep the existing slot-mapping behavior unchanged
+
+So the runner has started consuming page-layout information, but it still writes KV using the old block-level layout.
+
+### Why This Matters
+This phase is the first real bridge between Stage B planning and the runner.
+Before this, page metadata existed only on the request/planning side.
+Now the execution-preparation path can see that metadata and verify it is self-consistent.
+
+That reduces the gap to the next step, where page-layout metadata can begin to influence how prefill addressing is prepared.
+
+### Expected Validation
+Regression behavior should remain unchanged.
+The point of this phase is not to increase reuse yet, but to make page-span structure available all the way up to `prepare_prefill()`.
+
+### Recommended Next Step
+The next Stage B step should begin a controlled influence of page metadata on addressing preparation:
+- first thread page-span metadata deeper into prefill slot-planning
+- then experiment with page-aligned cached-boundary handling before any physical KV page allocator change
+## Phase 10 - Complete Stage B Boundary 2 With Page-Aware Prefill Preparation
+
+### Route Choice
+Stage B is now explicitly completed at the **Page-Aware Prefill Preparation** boundary.
+That means:
+- physical KV storage remains block-based
+- attention/context interfaces remain block-table and slot-mapping based
+- but page/span metadata now materially influences how prefill preparation is derived
+
+This deliberately stops short of true partial-block reuse.
+That next bridge belongs to the following addressing/storage phase.
+
+### Files Changed
+- `nanovllm/engine/sequence.py`
+- `nanovllm/engine/block_manager.py`
+- `nanovllm/engine/scheduler.py`
+- `nanovllm/engine/model_runner.py`
+- `nanovllm/engine/llm_engine.py`
+- `run_page_aware_prefill_checks.sh`
+
+### Main Design Change
+Added a request-side `prefill_layout` object on `Sequence` as the single source of truth for prefill page boundaries.
+It now stores:
+- `page_block_ids`
+- `cached_page_mask`
+- `cached_page_spans`
+- `uncached_page_spans`
+- `uncached_start_token`
+- `uncached_end_token`
+- `uncached_start_page`
+- `uncached_num_pages`
+- `uncached_num_tokens`
+
+`BlockManager.allocate()` now writes this layout back to the request before the request enters the running queue.
+`deallocate()` and decode append paths clear it so stale prefill metadata does not persist.
+
+### Prefill Planning Changes
+`PrefillPlan` now carries the explicit uncached token/page boundary fields used by the scheduler and runner:
+- `uncached_start_token`
+- `uncached_num_tokens`
+- `uncached_start_page`
+- `uncached_num_pages`
+
+The scheduler now uses `uncached_num_tokens` directly instead of recomputing the uncached cost from `cached_tokens`.
+
+### Runner Changes
+`ModelRunner.prepare_prefill()` now consumes the request-side prefill layout as its primary boundary source.
+It no longer derives the uncached start from `num_cached_tokens` except as a consistency assertion.
+
+Slot mapping is now generated page-by-page from:
+- request `logical_page_table`
+- `prefill_layout.uncached_*` boundaries
+- `block_id + block_offset + page_tokens`
+
+The physical result is still equivalent to the old block-range logic, and the runner asserts that equivalence during Stage B.
+
+### New Validation
+Added `run_page_aware_prefill_checks.sh`.
+This is a lightweight, non-model validation script that checks:
+- aligned block-boundary shared prefixes
+- non-aligned shared prefixes that still only reuse whole blocks
+- no-cache single request
+- full-hit complete-block reuse
+- lifecycle consistency for `prefill_layout` and `logical_page_table`
+- equality between legacy and page-aware prefill slot mapping
+
+### Observability
+Added lightweight per-run counters:
+- `prefill_cached_pages`
+- `prefill_uncached_pages`
+
+These are printed alongside the existing prefix-cache stats.
+
+### Why This Closes Stage B Boundary 2
+At this point page/span metadata is no longer passive.
+It affects prefill preparation in the runner, while the physical KV storage path still remains block-based.
+That is exactly the intended Stage B endpoint.
+
+### Recommended Next Step
+The next phase should target the true logic-to-storage bridge:
+- relax the assumption that cached boundaries align to full blocks
+- thread page-aware addressing deeper than a read-only equivalence layer
+- then decide whether the allocator/context/backend must grow a physical page abstraction
+

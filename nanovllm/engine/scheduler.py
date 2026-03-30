@@ -35,7 +35,7 @@ class Scheduler:
         while self.waiting and num_seqs < self.max_num_seqs:
             seq = self.waiting[0]
             plan = self.block_manager.make_prefill_plan(seq)
-            uncached_tokens = len(seq) - plan.cached_tokens
+            uncached_tokens = plan.uncached_num_tokens
             if num_batched_tokens + uncached_tokens > self.max_num_batched_tokens:
                 break
             if not self.block_manager.can_allocate(seq, plan):

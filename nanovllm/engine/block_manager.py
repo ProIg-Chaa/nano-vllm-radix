@@ -4,7 +4,7 @@ from enum import Enum, auto
 import xxhash
 import numpy as np
 
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import LogicalPageSpan, Sequence
 
 
 class Block:
@@ -230,6 +230,12 @@ class PrefillPlan:
     required_logical_pages: int
     page_block_ids: list[int]
     cached_page_mask: list[bool]
+    cached_page_spans: list[LogicalPageSpan]
+    uncached_page_spans: list[LogicalPageSpan]
+    uncached_start_token: int
+    uncached_num_tokens: int
+    uncached_start_page: int
+    uncached_num_pages: int
 
 
 class BlockManager:
@@ -253,6 +259,8 @@ class BlockManager:
             "miss_blocks": 0,
             "reused_tokens": 0,
             "reused_logical_pages": 0,
+            "prefill_cached_pages": 0,
+            "prefill_uncached_pages": 0,
             "new_blocks": 0,
             "eviction_passes": 0,
             "evicted_leaves": 0,
@@ -272,6 +280,34 @@ class BlockManager:
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
         return PrefixCache.compute_hash(token_ids, prefix)
+
+    def build_page_spans(self, cached_page_mask: list[bool], num_tokens: int) -> tuple[list[LogicalPageSpan], list[LogicalPageSpan]]:
+        if not cached_page_mask:
+            return [], []
+        spans = []
+        start_page = 0
+        current_cached = cached_page_mask[0]
+        for page_idx, is_cached in enumerate(cached_page_mask[1:], start=1):
+            if is_cached != current_cached:
+                spans.append(LogicalPageSpan(
+                    start_page,
+                    page_idx,
+                    start_page * self.logical_page_size,
+                    min(page_idx * self.logical_page_size, num_tokens),
+                    current_cached,
+                ))
+                start_page = page_idx
+                current_cached = is_cached
+        spans.append(LogicalPageSpan(
+            start_page,
+            len(cached_page_mask),
+            start_page * self.logical_page_size,
+            num_tokens,
+            current_cached,
+        ))
+        cached_spans = [span for span in spans if span.cached]
+        uncached_spans = [span for span in spans if not span.cached]
+        return cached_spans, uncached_spans
 
     def make_prefill_plan(self, seq: Sequence) -> PrefillPlan:
         steps = []
@@ -313,6 +349,15 @@ class BlockManager:
         required_logical_pages = (uncached_tokens + self.logical_page_size - 1) // self.logical_page_size
         assert len(page_block_ids) == seq.num_logical_pages
         assert len(cached_page_mask) == seq.num_logical_pages
+        cached_page_spans, uncached_page_spans = self.build_page_spans(cached_page_mask, len(seq))
+        total_span_pages = sum(span.end_page - span.start_page for span in cached_page_spans + uncached_page_spans)
+        assert total_span_pages == seq.num_logical_pages
+        uncached_start_token = uncached_page_spans[0].start_token if uncached_page_spans else len(seq)
+        uncached_start_page = uncached_page_spans[0].start_page if uncached_page_spans else seq.num_logical_pages
+        uncached_num_tokens = len(seq) - uncached_start_token
+        uncached_num_pages = sum(span.end_page - span.start_page for span in uncached_page_spans)
+        assert uncached_start_token == cached_tokens
+        assert uncached_num_pages == required_logical_pages
         return PrefillPlan(
             steps,
             cached_tokens,
@@ -321,6 +366,12 @@ class BlockManager:
             required_logical_pages,
             page_block_ids,
             cached_page_mask,
+            cached_page_spans,
+            uncached_page_spans,
+            uncached_start_token,
+            uncached_num_tokens,
+            uncached_start_page,
+            uncached_num_pages,
         )
 
     def can_allocate(self, seq: Sequence, plan: PrefillPlan | None = None) -> bool:
@@ -354,8 +405,11 @@ class BlockManager:
             plan = self.make_prefill_plan(seq)
 
         self.stats["alloc_requests"] += 1
+        self.stats["prefill_cached_pages"] += plan.cached_logical_pages
+        self.stats["prefill_uncached_pages"] += plan.uncached_num_pages
         protected_block_ids = {step.block_id for step in plan.steps if step.block_id != -1}
         self.apply_retention_policy(plan.required_free_blocks, protected_block_ids)
+        seq.clear_prefill_layout()
         seq.num_cached_tokens = plan.cached_tokens
         prefix_node = self.prefix_cache.root
 
@@ -383,6 +437,17 @@ class BlockManager:
                 prefix_node = self.prefix_cache.commit(prefix_node, block, step.block_hash, token_ids)
             seq.block_table.append(block_id)
         seq.sync_logical_page_table()
+        seq.sync_prefill_layout()
+        layout = seq.prefill_layout
+        assert layout is not None
+        assert layout.cached_page_mask == plan.cached_page_mask
+        assert layout.cached_page_spans == plan.cached_page_spans
+        assert layout.uncached_page_spans == plan.uncached_page_spans
+        assert layout.uncached_start_token == plan.uncached_start_token
+        assert layout.uncached_end_token == len(seq)
+        assert layout.uncached_start_page == plan.uncached_start_page
+        assert layout.uncached_num_pages == plan.uncached_num_pages
+        assert layout.uncached_num_tokens == plan.uncached_num_tokens
 
     def deallocate(self, seq: Sequence):
         self.stats["dealloc_requests"] += 1
@@ -391,11 +456,13 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
         seq.clear_logical_page_table()
+        seq.clear_prefill_layout()
 
     def can_append(self, seq: Sequence) -> bool:
         return self.allocator.has_free_blocks(len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
+        seq.clear_prefill_layout()
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:

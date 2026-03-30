@@ -102,6 +102,8 @@ class LLMEngine:
             f"hit_rate={stats['hit_rate']:.2%} "
             f"reused_tokens={stats['reused_tokens']} "
             f"reused_logical_pages={stats['reused_logical_pages']} "
+            f"prefill_cached_pages={stats['prefill_cached_pages']} "
+            f"prefill_uncached_pages={stats['prefill_uncached_pages']} "
             f"logical_page_size={stats['logical_page_size']} "
             f"new_blocks={stats['new_blocks']} "
             f"eviction_passes={stats['eviction_passes']} "
