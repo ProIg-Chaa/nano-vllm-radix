@@ -16,7 +16,7 @@ export PYTHONPATH="$ROOT_DIR"
 
 echo "[run] log_file=$LOG_FILE" | tee "$LOG_FILE"
 python - <<'INNER_PY' 2>&1 | tee -a "$LOG_FILE"
-from nanovllm.engine.block_manager import BlockManager
+from nanovllm.engine.block_manager import BlockManager, PlanStepKind
 from nanovllm.engine.model_runner import build_legacy_prefill_slot_mapping, build_page_aware_prefill_slot_mapping
 from nanovllm.engine.sequence import Sequence
 from nanovllm.sampling_params import SamplingParams
@@ -43,6 +43,7 @@ def validate_allocated_seq(seq, plan):
     assert layout.uncached_page_spans == plan.uncached_page_spans
     assert layout.cached_page_mask == plan.cached_page_mask
     assert layout.page_cached_tokens == plan.page_cached_tokens
+    assert sum(span.num_tokens for span in layout.copy_spans) <= plan.cached_tokens
     assert sum(layout.page_cached_tokens) == plan.cached_tokens
     assert all(page_cached_tokens in (0, PAGE_SIZE) for page_cached_tokens in layout.page_cached_tokens[:-1])
     assert sum(span.slot_end - span.slot_start for span in layout.cached_physical_spans) == plan.cached_tokens
@@ -68,6 +69,8 @@ def run_case(name, first_prompt, second_prompt=None, expected_cached_tokens=None
     plan1 = manager.make_prefill_plan(seq1)
     manager.allocate(seq1, plan1)
     validate_allocated_seq(seq1, plan1)
+    seq1.num_materialized_tokens = len(seq1)
+    manager.sync_materialized_partial_block(seq1)
     seq1.append_token(999)
     assert seq1.prefill_layout is None
     manager.deallocate(seq1)
@@ -95,6 +98,38 @@ def run_case(name, first_prompt, second_prompt=None, expected_cached_tokens=None
     assert not seq2.logical_page_table
     assert seq2.prefill_layout is None
     return result
+
+
+def run_active_partial_copy_case():
+    manager = BlockManager(64, BLOCK_SIZE, PAGE_SIZE)
+    common_nonaligned = [77] * 600
+    seq1 = make_seq(common_nonaligned + [1, 2])
+    plan1 = manager.make_prefill_plan(seq1)
+    manager.allocate(seq1, plan1)
+    seq1.num_materialized_tokens = len(seq1)
+    manager.sync_materialized_partial_block(seq1)
+
+    seq2 = make_seq(common_nonaligned + [3, 4])
+    plan2 = manager.make_prefill_plan(seq2)
+    assert plan2.cached_tokens == 600
+    assert any(step.kind == PlanStepKind.PARTIAL_HIT_USED_COPY for step in plan2.steps)
+    manager.allocate(seq2, plan2)
+    validate_allocated_seq(seq2, plan2)
+    assert seq2.prefill_layout is not None
+    assert len(seq2.prefill_layout.copy_spans) == 1
+    copy_span = seq2.prefill_layout.copy_spans[0]
+    assert copy_span.src_block_id == seq1.block_table[-1]
+    assert copy_span.dst_block_id == seq2.block_table[-1]
+    assert copy_span.num_tokens == 88
+    manager.deallocate(seq2)
+    manager.deallocate(seq1)
+    return {
+        "case": "active_partial_tail_copy_on_write",
+        "second_cached_tokens": plan2.cached_tokens,
+        "copy_span_tokens": copy_span.num_tokens,
+        "uncached_start_token": plan2.uncached_start_token,
+        "uncached_num_tokens": plan2.uncached_num_tokens,
+    }
 
 
 cases = []
@@ -127,6 +162,7 @@ cases.append(run_case(
     common_partial + [10] * 259,
     expected_cached_tokens=512,
 ))
+cases.append(run_active_partial_copy_case())
 
 for case in cases:
     print(case)

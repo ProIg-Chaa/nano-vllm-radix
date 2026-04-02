@@ -53,6 +53,17 @@ class PhysicalAddressSpan:
 
 
 @dataclass
+class PhysicalCopySpan:
+    src_block_id: int
+    dst_block_id: int
+    src_block_offset: int
+    dst_block_offset: int
+    num_tokens: int
+    start_token: int
+    end_token: int
+
+
+@dataclass
 class RequestPrefillLayout:
     page_block_ids: list[int]
     cached_page_mask: list[bool]
@@ -61,6 +72,7 @@ class RequestPrefillLayout:
     uncached_page_spans: list[LogicalPageSpan]
     cached_physical_spans: list[PhysicalAddressSpan]
     uncached_physical_spans: list[PhysicalAddressSpan]
+    copy_spans: list[PhysicalCopySpan]
     uncached_start_token: int
     uncached_end_token: int
     uncached_start_page: int
@@ -79,6 +91,7 @@ class Sequence:
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
+        self.num_materialized_tokens = 0
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
         self.block_table = []
@@ -119,8 +132,18 @@ class Sequence:
         return (self.num_tokens + self.block_size - 1) // self.block_size
 
     @property
+    def num_materialized_blocks(self):
+        return (self.num_materialized_tokens + self.block_size - 1) // self.block_size if self.num_materialized_tokens else 0
+
+    @property
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
+
+    @property
+    def last_materialized_block_num_tokens(self):
+        if self.num_materialized_tokens == 0:
+            return 0
+        return self.num_materialized_tokens - (self.num_materialized_blocks - 1) * self.block_size
 
     @property
     def num_cached_logical_pages(self):
@@ -141,6 +164,11 @@ class Sequence:
     def block(self, i):
         assert 0 <= i < self.num_blocks
         return self.token_ids[i * self.block_size: (i + 1) * self.block_size]
+
+    def materialized_block(self, i):
+        assert 0 <= i < self.num_materialized_blocks
+        end = min((i + 1) * self.block_size, self.num_materialized_tokens)
+        return self.token_ids[i * self.block_size: end]
 
     def logical_page(self, i):
         assert 0 <= i < self.num_logical_pages
@@ -248,7 +276,7 @@ class Sequence:
             return spans
         return [span for span in spans if span.cached is cached]
 
-    def sync_prefill_layout(self):
+    def sync_prefill_layout(self, copy_spans: list[PhysicalCopySpan] | None = None):
         if not self.block_table:
             self.prefill_layout = None
             return
@@ -275,6 +303,7 @@ class Sequence:
             uncached_page_spans=uncached_page_spans,
             cached_physical_spans=cached_physical_spans,
             uncached_physical_spans=uncached_physical_spans,
+            copy_spans=[] if copy_spans is None else copy_spans,
             uncached_start_token=uncached_start_token,
             uncached_end_token=uncached_end_token,
             uncached_start_page=uncached_start_page,
@@ -293,6 +322,7 @@ class Sequence:
     def __getstate__(self):
         return (
             self.num_tokens,
+            self.num_materialized_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
             self.block_table,
@@ -300,7 +330,13 @@ class Sequence:
         )
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        (
+            self.num_tokens,
+            self.num_materialized_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.block_table,
+        ) = state[:-1]
         self.logical_page_table = []
         self.prefill_layout = None
         if self.num_completion_tokens == 0:

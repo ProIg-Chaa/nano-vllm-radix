@@ -4,7 +4,7 @@ from enum import Enum, auto
 import xxhash
 import numpy as np
 
-from nanovllm.engine.sequence import LogicalPageSpan, Sequence
+from nanovllm.engine.sequence import LogicalPageSpan, PhysicalCopySpan, Sequence
 
 
 class Block:
@@ -211,6 +211,7 @@ class PlanStepKind(Enum):
     HIT_USED = auto()
     HIT_FREE = auto()
     PARTIAL_HIT_FREE = auto()
+    PARTIAL_HIT_USED_COPY = auto()
     MISS = auto()
 
 
@@ -315,17 +316,53 @@ class BlockManager:
         self.partial_prefix_to_block_ids.setdefault(prefix_hash_before_block, set()).add(block_id)
         self.partial_block_to_prefix[block_id] = prefix_hash_before_block
 
-    def find_best_partial_hit(self, prefix_hash_before_block: int, token_ids: list[int]) -> tuple[int, int]:
+    def get_materialized_partial_info(self, seq: Sequence) -> tuple[int, int, list[int]] | None:
+        if not seq.block_table or seq.num_materialized_tokens == 0:
+            return None
+        if seq.last_materialized_block_num_tokens in (0, self.block_size):
+            return None
+        block_idx = seq.num_materialized_blocks - 1
+        block_id = seq.block_table[block_idx]
+        prefix_hash = -1
+        for i in range(block_idx):
+            prefix_hash = self.prefix_cache.compute_block_hash(seq.materialized_block(i), prefix_hash)
+        return block_id, prefix_hash, seq.materialized_block(block_idx)
+
+    def clear_materialized_partial_block(self, seq: Sequence):
+        info = self.get_materialized_partial_info(seq)
+        if info is None:
+            return
+        block_id, _, _ = info
+        self.unregister_partial_block(block_id)
+
+    def sync_materialized_partial_block(self, seq: Sequence):
+        info = self.get_materialized_partial_info(seq)
+        if info is None:
+            return
+        block_id, prefix_hash_before_block, token_ids = info
+        self.register_partial_block(block_id, prefix_hash_before_block, token_ids)
+
+    def find_best_partial_hit(self, prefix_hash_before_block: int, token_ids: list[int]) -> tuple[int, int, bool]:
         best_block_id = -1
         best_shared_prefix_tokens = 0
+        best_is_used = False
         for block_id in self.partial_prefix_to_block_ids.get(prefix_hash_before_block, set()):
-            if self.allocator.is_used(block_id):
-                continue
             shared_prefix_tokens = self.common_prefix_len(self.blocks[block_id].token_ids, token_ids)
-            if shared_prefix_tokens > best_shared_prefix_tokens:
+            is_used = self.allocator.is_used(block_id)
+            if (
+                shared_prefix_tokens > best_shared_prefix_tokens
+                or (
+                    shared_prefix_tokens == best_shared_prefix_tokens
+                    and shared_prefix_tokens > 0
+                    and best_block_id != -1
+                    and best_is_used
+                    and not is_used
+                )
+            ):
                 best_block_id = block_id
                 best_shared_prefix_tokens = shared_prefix_tokens
-        return best_block_id, best_shared_prefix_tokens
+                best_is_used = is_used
+        return best_block_id, best_shared_prefix_tokens, best_is_used
 
     def build_page_spans(self, cached_tokens: int, num_tokens: int, num_logical_pages: int) -> tuple[list[LogicalPageSpan], list[LogicalPageSpan]]:
         spans = []
@@ -383,15 +420,18 @@ class BlockManager:
                 ])
                 prefix_node = node
             else:
-                partial_block_id, shared_prefix_tokens = (-1, 0)
+                partial_block_id, shared_prefix_tokens, partial_block_is_used = (-1, 0, False)
                 if not cache_miss and len(token_ids) < self.block_size:
-                    partial_block_id, shared_prefix_tokens = self.find_best_partial_hit(prefix_hash_before_block, token_ids)
+                    partial_block_id, shared_prefix_tokens, partial_block_is_used = self.find_best_partial_hit(
+                        prefix_hash_before_block,
+                        token_ids,
+                    )
                 if partial_block_id != -1 and shared_prefix_tokens > 0:
                     cache_miss = True
                     cached_tokens += shared_prefix_tokens
                     required_free_blocks += 1
                     steps.append(PlanStep(
-                        PlanStepKind.PARTIAL_HIT_FREE,
+                        PlanStepKind.PARTIAL_HIT_USED_COPY if partial_block_is_used else PlanStepKind.PARTIAL_HIT_FREE,
                         partial_block_id,
                         -1,
                         token_ids,
@@ -485,6 +525,7 @@ class BlockManager:
         seq.clear_prefill_layout()
         seq.num_cached_tokens = plan.cached_tokens
         prefix_node = self.prefix_cache.root
+        copy_spans = []
 
         for step in plan.steps:
             self.stats["queried_blocks"] += 1
@@ -506,13 +547,31 @@ class BlockManager:
                 self.stats["reused_logical_pages"] += step.shared_prefix_tokens // self.logical_page_size
                 block_id = step.block_id
                 block = self.allocator.allocate_block(block_id)
-            else:
+            elif step.kind == PlanStepKind.PARTIAL_HIT_FREE:
                 block_id = step.block_id
                 self.unregister_partial_block(block_id)
                 block = self.allocator.allocate_block(block_id)
                 self.stats["reused_tokens"] += step.shared_prefix_tokens
                 self.stats["partial_reused_tokens"] += step.shared_prefix_tokens
                 self.stats["reused_logical_pages"] += step.shared_prefix_tokens // self.logical_page_size
+            else:
+                src_block_id = step.block_id
+                block_start_token = len(seq.block_table) * self.block_size
+                block_id, block = self.allocator.allocate_next_free_block()
+                self.unregister_partial_block(block_id)
+                self.stats["new_blocks"] += 1
+                self.stats["reused_tokens"] += step.shared_prefix_tokens
+                self.stats["partial_reused_tokens"] += step.shared_prefix_tokens
+                self.stats["reused_logical_pages"] += step.shared_prefix_tokens // self.logical_page_size
+                copy_spans.append(PhysicalCopySpan(
+                    src_block_id=src_block_id,
+                    dst_block_id=block_id,
+                    src_block_offset=0,
+                    dst_block_offset=0,
+                    num_tokens=step.shared_prefix_tokens,
+                    start_token=block_start_token,
+                    end_token=block_start_token + step.shared_prefix_tokens,
+                ))
 
             if step.block_hash != -1:
                 prefix_node = self.prefix_cache.commit(prefix_node, block, step.block_hash, token_ids)
@@ -520,7 +579,7 @@ class BlockManager:
                 block.update(-1, token_ids)
             seq.block_table.append(block_id)
         seq.sync_logical_page_table()
-        seq.sync_prefill_layout()
+        seq.sync_prefill_layout(copy_spans=copy_spans)
         layout = seq.prefill_layout
         assert layout is not None
         assert layout.cached_page_mask == plan.cached_page_mask
@@ -535,16 +594,11 @@ class BlockManager:
 
     def deallocate(self, seq: Sequence):
         self.stats["dealloc_requests"] += 1
-        prefix_hash = -1
-        for block_idx, block_id in enumerate(seq.block_table):
-            token_ids = seq.block(block_idx)
-            if len(token_ids) < self.block_size:
-                self.register_partial_block(block_id, prefix_hash, token_ids)
-            else:
-                self.unregister_partial_block(block_id)
-            prefix_hash = self.prefix_cache.compute_block_hash(token_ids, prefix_hash)
+        self.clear_materialized_partial_block(seq)
+        self.sync_materialized_partial_block(seq)
         for block_id in reversed(seq.block_table):
             self.allocator.decref(block_id)
+        seq.num_materialized_tokens = 0
         seq.num_cached_tokens = 0
         seq.block_table.clear()
         seq.clear_logical_page_table()
@@ -554,6 +608,7 @@ class BlockManager:
         return self.allocator.has_free_blocks(len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
+        self.clear_materialized_partial_block(seq)
         seq.clear_prefill_layout()
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]

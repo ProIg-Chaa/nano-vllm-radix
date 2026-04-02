@@ -5,7 +5,13 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
-from nanovllm.engine.sequence import LogicalPageSpan, PhysicalAddressSpan, RequestPrefillLayout, Sequence
+from nanovllm.engine.sequence import (
+    LogicalPageSpan,
+    PhysicalAddressSpan,
+    PhysicalCopySpan,
+    RequestPrefillLayout,
+    Sequence,
+)
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -23,6 +29,7 @@ def synthesize_uncached_prefill_layout(seq: Sequence) -> RequestPrefillLayout:
         uncached_page_spans=uncached_page_spans,
         cached_physical_spans=[],
         uncached_physical_spans=[],
+        copy_spans=[],
         uncached_start_token=0,
         uncached_end_token=len(seq),
         uncached_start_page=0,
@@ -202,6 +209,7 @@ class ModelRunner:
                 uncached_physical_tokens = sum(
                     span.slot_end - span.slot_start for span in layout.uncached_physical_spans
                 )
+                copied_tokens = sum(span.num_tokens for span in layout.copy_spans)
                 total_span_pages = sum(
                     span.end_page - span.start_page
                     for span in layout.cached_page_spans + layout.uncached_page_spans
@@ -216,6 +224,7 @@ class ModelRunner:
                 assert layout.uncached_num_pages == seq.num_logical_pages - seq.num_cached_logical_pages
                 assert cached_physical_tokens == cached_page_tokens
                 assert uncached_physical_tokens == uncached_page_tokens
+                assert copied_tokens <= cached_physical_tokens
                 if layout.cached_page_spans:
                     assert len(layout.cached_page_spans) == 1
                     assert layout.cached_page_spans[0].start_page == 0
@@ -225,11 +234,37 @@ class ModelRunner:
                 if layout.uncached_physical_spans:
                     assert layout.uncached_physical_spans[0].start_token == layout.uncached_start_token
                     assert layout.uncached_physical_spans[-1].end_token == len(seq)
+                for copy_span in layout.copy_spans:
+                    assert copy_span.num_tokens == copy_span.end_token - copy_span.start_token
+                    assert 0 <= copy_span.src_block_offset < self.block_size
+                    assert 0 <= copy_span.dst_block_offset < self.block_size
+                    assert copy_span.src_block_offset + copy_span.num_tokens <= self.block_size
+                    assert copy_span.dst_block_offset + copy_span.num_tokens <= self.block_size
             metadata.append(layout)
         return metadata
 
+    def apply_prefill_copy_spans(self, layouts: list[RequestPrefillLayout]):
+        for layout in layouts:
+            for copy_span in layout.copy_spans:
+                if copy_span.num_tokens == 0:
+                    continue
+                self.kv_cache[
+                    :,
+                    :,
+                    copy_span.dst_block_id,
+                    copy_span.dst_block_offset: copy_span.dst_block_offset + copy_span.num_tokens,
+                ].copy_(
+                    self.kv_cache[
+                        :,
+                        :,
+                        copy_span.src_block_id,
+                        copy_span.src_block_offset: copy_span.src_block_offset + copy_span.num_tokens,
+                    ]
+                )
+
     def prepare_prefill(self, seqs: list[Sequence]):
         logical_page_metadata = self.prepare_logical_page_metadata(seqs)
+        self.apply_prefill_copy_spans(logical_page_metadata)
         input_ids = []
         positions = []
         cu_seqlens_q = [0]

@@ -1100,3 +1100,91 @@ Missing pieces include:
 - partial reuse for blocks still in active use
 - copy-on-write or smaller physical allocation units
 - generalized page/token-level prefix indexing beyond retained free partial tails
+
+## Phase 14 - Materialized Partial Sources And Active Copy-On-Write
+
+### Route Choice
+This phase moves beyond retained free partial tails and enables the first safe path for
+partial reuse from blocks that are still referenced by active requests.
+
+The key design constraint is that partial-prefix reuse can only copy from KV that has
+already been materialized by a previous model run. This phase therefore adds explicit
+tracking for that boundary instead of assuming `num_tokens` always equals the amount of
+available KV.
+
+### Files Changed
+- `nanovllm/engine/sequence.py`
+- `nanovllm/engine/block_manager.py`
+- `nanovllm/engine/model_runner.py`
+- `nanovllm/engine/scheduler.py`
+- `run_page_aware_prefill_checks.sh`
+
+### Main Design Change
+Added `num_materialized_tokens` to `Sequence`.
+
+This separates:
+- logical sequence length
+- materialized KV prefix length
+
+Running requests now only contribute partial-tail reuse candidates for the prefix whose KV
+is already present in cache.
+
+### Partial Index Change
+The partial-tail index is now driven by the materialized boundary:
+- `BlockManager.sync_materialized_partial_block(seq)`
+- `BlockManager.clear_materialized_partial_block(seq)`
+
+This prevents the partial-tail index from accidentally exposing the newest sampled token
+before its KV has actually been written.
+
+### Planning Change
+Added `PlanStepKind.PARTIAL_HIT_USED_COPY`.
+
+`make_prefill_plan()` can now choose between:
+- `PARTIAL_HIT_FREE`
+- `PARTIAL_HIT_USED_COPY`
+
+for a matching partial tail under the same prefix path.
+
+Free candidates are still preferred when the matched prefix length ties.
+
+### Allocation / Runner Change
+For `PARTIAL_HIT_USED_COPY`, allocation now:
+- allocates a fresh destination block
+- preserves the reused prefix logically
+- records a `PhysicalCopySpan`
+
+`ModelRunner.prepare_prefill()` now applies those copy spans directly to `kv_cache`
+before the prefill forward. This is the first explicit copy-on-write bridge from
+logical finer-grained reuse planning to physical KV state mutation.
+
+### Scheduler Lifecycle Change
+`Scheduler.postprocess()` now marks the just-executed prefix as materialized before
+appending the newly sampled token.
+
+This keeps the active partial-tail index aligned with real KV availability instead of raw
+token count.
+
+### Validation
+`run_page_aware_prefill_checks.sh` now includes:
+- retained free partial-tail reuse
+- active partial-tail copy-on-write reuse
+
+The active case asserts:
+- `cached_tokens == 600`
+- `PlanStepKind.PARTIAL_HIT_USED_COPY` is emitted
+- exactly one copy span is generated
+- the copied prefix length is 88 tokens inside the last partial block
+
+### Current Boundary
+This still does **not** mean arbitrary token-level radix reuse is finished.
+
+What is now supported:
+- whole-block hits
+- retained free partial-tail prefix reuse
+- materialized active partial-tail prefix reuse via copy-on-write
+
+What is still missing:
+- more general non-tail partial matching
+- page/token-level tree indexing beyond the current last-block path
+- broader policy/overhead tuning for copy-on-write under load
